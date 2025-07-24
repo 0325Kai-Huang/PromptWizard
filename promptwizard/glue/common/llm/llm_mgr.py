@@ -14,6 +14,64 @@ from ..utils.runtime_tasks import str_to_class
 import os
 logger = get_glue_logger(__name__)
 
+
+global_session: Optional[aiohttp.ClientSession] = None
+global_connector: Optional[aiohttp.TCPConnector] = None
+
+async def init_global_session():
+    """异步初始化全局 session"""
+    global global_session, global_connector
+    global_connector = aiohttp.TCPConnector(
+        limit=settings.CONNECTOR_LIMIT,
+        limit_per_host=settings.CONNECTOR_LIMIT_PER_HOST,
+        force_close=settings.CONNECTOR_FORCE_CLOSE,
+        keepalive_timeout=settings.CONNECTOR_KEEPALIVE_TIMEOUT,
+    ) # 此配置没有复现error,用下面的配置项复现
+    # global_connector = aiohttp.TCPConnector(
+    #     limit=500,
+    #     limit_per_host=100,
+    #     force_close=False,
+    #     keepalive_timeout=3,
+    #     enable_cleanup_closed=True,
+    # )
+
+    global_session = aiohttp.ClientSession(connector=global_connector)
+# 自定义异步模型调用，用于替换openai的调用
+async def async_request_post(trace_id, url, request_data, timeout, module, headers=None):
+    """
+    异步请求抽取公共逻辑
+    """
+    # ASYNC_RETRIES为重试次数
+    for attempt in range(settings.ASYNC_RETRIES):
+        try:
+            if not global_session:
+                await init_global_session()
+            # 使用aiohttp发送异步请求
+            async with global_session.post(url=url, json=request_data, timeout=timeout, headers=headers) as response:
+                response.raise_for_status()
+                # 根据响应类型处理数据
+                content_type = response.headers.get('Content-Type', '')
+                if 'json' in content_type:
+                    data = await response.json()
+                else:
+                    data = await response.text()
+                # breakpoint()
+                return response.status, data
+        except Exception as e:
+            if isinstance(e, asyncio.TimeoutError):
+                error(f"trace_id: {trace_id}, {module} request timeout")
+                raise
+            elif isinstance(e, (aiohttp.ClientOSError, ConnectionResetError, aiohttp.ServerDisconnectedError)):
+                if attempt == (settings.ASYNC_RETRIES-1):
+                    error(f"trace_id: {trace_id}, {module} Connection error: {e}, retry failed")
+                    raise
+                error(f"trace_id: {trace_id}, {module} Connection error: {e}, attempt: {attempt}, ASYNC_RETRIES: {settings.ASYNC_RETRIES}")
+            else:
+                error_info = traceback.format_exc()
+                error(f"trace_id: {trace_id}, {module} request failed: error message:{error_info}")
+                raise
+
+
 def call_api(messages):
 
     from openai import OpenAI
@@ -42,6 +100,8 @@ def call_api(messages):
             messages=messages,
             temperature=0.0,
         )
+        ## 替换自己训练的模型去调用，使得prompt更适配自己的模型
+        response = async_request_post(trace_id, url, request_data, timeout, module, headers)
 
     prediction = response.choices[0].message.content
     return prediction
